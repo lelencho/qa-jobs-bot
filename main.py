@@ -2,21 +2,38 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = "seen_jobs.json"
-MAX_JOBS = 5
+MAX_JOBS = 8
 MAX_AGE_DAYS = 30
 ARBEITNOW_PAGES = 3
 REMOTIVE_SEARCHES = ("QA", "tester")
 HEADERS = {"User-Agent": "DailyQAJobsBot/1.0"}
 
+STAFFAM_URL = "https://staff.am/en/jobs/quality-assurance"
+# staff.am is a normal website, so it gets a browser-like User-Agent.
+STAFFAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+
 # Word-boundary regex so "qa" doesn't match inside other words, and
-# more QA job-title variants are recognised than before.
+# more QA job-title variants are recognised.
 QA_PATTERN = re.compile(
     r"\bqa\b|\bqc\b|\bsdet\b|quality assurance|quality engineer|"
     r"quality analyst|\btesters?\b|software testing|test engineer|"
@@ -61,6 +78,86 @@ def get_json(url, params=None):
     return response.json()
 
 
+# ---------------------------------------------------------------- Staff.am
+JOB_HREF = re.compile(r"/jobs/quality-assurance/[^/?#]+/?$")
+DATE_IN_TEXT = re.compile(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})")
+
+
+def parse_deadline(text):
+    """Finds a date like '15 November 2026' in the job card text."""
+    for day, month_name, year in DATE_IN_TEXT.findall(text):
+        month = MONTHS.get(month_name.lower())
+        if month:
+            try:
+                return datetime(int(year), month, int(day), 23, 59,
+                                tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def fetch_staffam(stats):
+    response = requests.get(STAFFAM_URL, headers=STAFFAM_HEADERS, timeout=25)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    found = []
+    done = set()
+    now = datetime.now(timezone.utc)
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"].split("?")[0].split("#")[0]
+        if not JOB_HREF.search(href):
+            continue
+        title = link.get_text(" ", strip=True)
+        if not title or title.lower() == "view more":
+            continue
+        url = urljoin("https://staff.am", href)
+        if url in done:
+            continue
+        done.add(url)
+        stats["Staff.am"]["fetched"] += 1
+
+        # Walk up to the job "card" that also contains the company link.
+        card = link
+        for _ in range(5):
+            if card.parent is None:
+                break
+            card = card.parent
+            if card.find("a", href=re.compile(r"/company/")):
+                break
+
+        company = "Not specified"
+        for company_link in card.find_all("a", href=re.compile(r"/company/")):
+            name = company_link.get_text(" ", strip=True)
+            if name:
+                company = name
+                break
+
+        card_text = card.get_text(" ", strip=True)
+        deadline = parse_deadline(card_text)
+        if deadline and deadline < now:
+            continue  # expired
+
+        location = "Yerevan" if "yerevan" in card_text.lower() else "Armenia"
+        if "remote" in card_text.lower():
+            location += " (Remote)"
+
+        if is_qa({"title": title}):
+            found.append({
+                "title": title,
+                "company": company,
+                "location": location,
+                "salary": "Not specified",
+                "url": url,
+                "date": "",  # the listing shows a deadline, not a post date
+                "deadline": deadline.strftime("%d %b %Y") if deadline else "",
+                "source": "Staff.am",
+            })
+    return found
+
+
+# ---------------------------------------------------------------- Remotive
 def fetch_remotive(stats):
     found = []
     seen_urls = set()
@@ -93,6 +190,7 @@ def fetch_remotive(stats):
     return found
 
 
+# --------------------------------------------------------------- Arbeitnow
 def fetch_arbeitnow(stats):
     found = []
     for page in range(1, ARBEITNOW_PAGES + 1):
@@ -125,21 +223,24 @@ def fetch_arbeitnow(stats):
     return found
 
 
+# ------------------------------------------------------------------ common
 def fetch_jobs():
-    stats = {
-        "Remotive": {"fetched": 0, "matched": 0},
-        "Arbeitnow": {"fetched": 0, "matched": 0},
-    }
+    # Staff.am first, so Armenian jobs are listed first.
+    sources = (
+        ("Staff.am", fetch_staffam),
+        ("Remotive", fetch_remotive),
+        ("Arbeitnow", fetch_arbeitnow),
+    )
+    stats = {name: {"fetched": 0, "matched": 0} for name, _ in sources}
     errors = []
     jobs = []
 
-    for name, fetcher in (("Remotive", fetch_remotive),
-                          ("Arbeitnow", fetch_arbeitnow)):
+    for name, fetcher in sources:
         try:
             result = fetcher(stats)
             stats[name]["matched"] = len(result)
             jobs.extend(result)
-        except Exception as exc:  # one broken source must not kill the other
+        except Exception as exc:  # one broken source must not kill the others
             errors.append(f"{name}: {exc}")
             print(f"{name} source failed: {exc!r}")
 
@@ -149,7 +250,17 @@ def fetch_jobs():
         if url.startswith("https://"):
             unique[url] = job
 
-    ordered = sorted(unique.values(), key=lambda j: j["date"], reverse=True)
+    # Newest first inside each source, then take turns between sources so one
+    # source can't fill the whole message.
+    by_source = {}
+    for job in sorted(unique.values(), key=lambda j: j["date"], reverse=True):
+        by_source.setdefault(job["source"], []).append(job)
+
+    ordered = []
+    while any(by_source.values()):
+        for source_jobs in by_source.values():
+            if source_jobs:
+                ordered.append(source_jobs.pop(0))
     return ordered, stats, errors
 
 
@@ -187,6 +298,10 @@ def main():
                 f"🏢 {job['company']}",
                 f"📍 {job['location']}",
                 f"💰 {job['salary']}",
+            ])
+            if job.get("deadline"):
+                lines.append(f"⏳ Deadline: {job['deadline']}")
+            lines.extend([
                 f"🔗 {job['url']}",
                 f"Source: {job['source']}",
                 "",
@@ -208,8 +323,7 @@ def main():
     )
     response.raise_for_status()
 
-    # Keep insertion order and drop the OLDEST entries (the old code sorted
-    # alphabetically, so it dropped random URLs and could cause repeats).
+    # Keep insertion order and drop the OLDEST entries.
     for job in new_jobs:
         if job["url"] not in seen:
             seen_list.append(job["url"])
